@@ -4,6 +4,8 @@ import { test } from "node:test";
 import {
   analyzeProbe,
   auditToolsDump,
+  extractServerCommand,
+  formatReports,
   gradeFor,
   parseCommandLine,
   parseConfig,
@@ -11,7 +13,7 @@ import {
   targetFromCommand,
   validateTools,
 } from "../src/audit.js";
-import { probeServer } from "../src/probe.js";
+import { DEFAULT_TIMEOUT_MS, probeServer } from "../src/probe.js";
 import type { ProbeResult } from "../src/types.js";
 
 const goodTools = [
@@ -186,9 +188,37 @@ test("tools/list failure is a FAIL with TOOLS_LIST_FAILED", () => {
   assert.ok(r.issues.some((i) => i.code === "TOOLS_LIST_FAILED"));
 });
 
-test("slow handshake warns", () => {
-  const r = analyzeProbe("x", baseProbe({ initializeMs: 9000 }));
-  assert.ok(r.issues.some((i) => i.code === "HANDSHAKE_SLOW"));
+test("slow handshake: info under 30s (launcher-dominated), warning above 30s", () => {
+  const info = analyzeProbe("x", baseProbe({ initializeMs: 9000 }));
+  const infoIssue = info.issues.find((i) => i.code === "HANDSHAKE_SLOW");
+  assert.ok(infoIssue, "expected a HANDSHAKE_SLOW note at 9000ms");
+  assert.equal(infoIssue.severity, "info");
+  assert.equal(info.verdict, "PASS", "launcher latency alone must not cost the verdict");
+  const warn = analyzeProbe("x", baseProbe({ initializeMs: 45000 }));
+  const warnIssue = warn.issues.find((i) => i.code === "HANDSHAKE_SLOW");
+  assert.equal(warnIssue?.severity, "warning");
+  assert.equal(warn.verdict, "WARN");
+});
+
+test("partially undescribed parameters are an info finding naming them", () => {
+  const issues = validateTools([
+    {
+      name: "mixed",
+      description: "A tool where only some parameters carry descriptions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          known: { type: "string", description: "The documented parameter." },
+          mystery: { type: "string" },
+        },
+      },
+    },
+  ]);
+  const partial = issues.find((i) => i.code === "PARAMS_PARTIALLY_UNDESCRIBED");
+  assert.ok(partial, `expected PARAMS_PARTIALLY_UNDESCRIBED, got ${issues.map((i) => i.code).join(",")}`);
+  assert.equal(partial.severity, "info");
+  assert.match(partial.evidence ?? "", /mystery/);
+  assert.ok(!issues.some((i) => i.code === "PARAMS_UNDESCRIBED"));
 });
 
 test("offline dump audit scores without a probe", () => {
@@ -206,14 +236,27 @@ test("parseCommandLine honors quotes", () => {
   assert.deepEqual(parseCommandLine(""), []);
 });
 
-test("parseConfig reads mcpServers, skips entries without a command", async () => {
+test("parseConfig reads mcpServers and surfaces remote (url) entries instead of skipping them", async () => {
   const text = await readFile(new URL("./fixtures/sample-config.json", import.meta.url), "utf8");
   const targets = parseConfig(text);
-  assert.equal(targets.length, 2);
-  assert.deepEqual(targets.map((t) => t.label).sort(), ["broken", "good"]);
+  assert.equal(targets.length, 3);
+  assert.deepEqual(targets.map((t) => t.label).sort(), ["broken", "disabled-no-command", "good"]);
+  const remote = targets.find((t) => t.label === "disabled-no-command");
+  assert.equal(remote?.remoteUrl, "https://example.invalid/mcp");
   const only = parseConfig(text, "good");
   assert.equal(only.length, 1);
   assert.equal(only[0].command, "node");
+  const onlyRemote = parseConfig(text, "disabled-no-command");
+  assert.equal(onlyRemote.length, 1);
+  assert.equal(onlyRemote[0].remoteUrl, "https://example.invalid/mcp");
+});
+
+test("parseConfig returns a remote target for a remote-only config instead of throwing", () => {
+  const targets = parseConfig(
+    JSON.stringify({ servers: { remote1: { type: "http", url: "https://mcp.deepwiki.com/mcp" } } }),
+  );
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].remoteUrl, "https://mcp.deepwiki.com/mcp");
 });
 
 test("parseConfig accepts a bare {command, args} object and rejects junk", () => {
@@ -288,4 +331,112 @@ test("probe: nonexistent command is UNREACHABLE, not a crash of the auditor", as
   const report = analyzeProbe("ghost", probe);
   assert.equal(report.verdict, "UNREACHABLE");
   assert.equal(report.score, 0);
+});
+
+// --- production-validation regressions (2026-10-22 battery) -------------------
+
+test("P-001: extractServerCommand passes server --flags through verbatim", () => {
+  // The py-git repro: --repository must survive, with its value, in order.
+  assert.deepEqual(
+    extractServerCommand(["uvx", "mcp-server-git", "--repository", "/tmp/repo"]),
+    ["uvx", "mcp-server-git", "--repository", "/tmp/repo"],
+  );
+  // mcpaudit's own flags are still extracted wherever they appear pre-`--`.
+  assert.deepEqual(extractServerCommand(["sleep", "60", "--timeout", "5000"]), ["sleep", "60"]);
+  assert.deepEqual(extractServerCommand(["node", "s.mjs", "--json"]), ["node", "s.mjs"]);
+  // `--` forces everything after it into the server command, even mcpaudit-named flags.
+  assert.deepEqual(
+    extractServerCommand(["node", "s.mjs", "--", "--timeout", "5000"]),
+    ["node", "s.mjs", "--timeout", "5000"],
+  );
+});
+
+test("P-002/P-005: a URL target becomes a remote target, probed as stdio-unsupported", async () => {
+  const t = targetFromCommand(["https://mcp.context7.com/mcp"]);
+  assert.equal(t.remoteUrl, "https://mcp.context7.com/mcp");
+  const probe = await probeServer(t, { timeoutMs: 5000 });
+  assert.equal(probe.connected, false);
+  assert.match(probe.connectError ?? "", /stdio/i);
+  const report = analyzeProbe(t.label, probe);
+  assert.equal(report.verdict, "UNREACHABLE");
+  assert.match(report.issues[0].detail, /stdio/i);
+});
+
+test("P-003: prompt/resource-only server is not failed for having no tools", () => {
+  const r = analyzeProbe(
+    "prompts-only",
+    baseProbe({ tools: [], toolsCapability: false, promptsCount: 2, resourcesCount: 3, badCallOutcome: "error" }),
+  );
+  assert.equal(r.verdict, "PASS", JSON.stringify(r.issues));
+  assert.ok(!r.issues.some((i) => i.severity === "error"));
+  assert.ok(r.issues.some((i) => i.code === "PROMPTS_RESOURCES_ONLY" && i.severity === "info"));
+  assert.ok(!r.issues.some((i) => i.code === "TOOLS_CAPABILITY_MISSING"));
+  assert.equal(r.summary.promptsCount, 2);
+  assert.equal(r.summary.resourcesCount, 3);
+});
+
+test("P-003: zero tools with a tools capability advertised is still an error", () => {
+  const r = analyzeProbe("empty-tools", baseProbe({ tools: [], toolsCapability: true }));
+  assert.equal(r.verdict, "FAIL");
+  assert.ok(r.issues.some((i) => i.code === "NO_TOOLS" && i.severity === "error"));
+});
+
+test("P-003: zero tools and no other surface is a warning, not an error", () => {
+  const r = analyzeProbe(
+    "empty-everything",
+    baseProbe({ tools: [], toolsCapability: false, promptsCount: 0, resourcesCount: 0 }),
+  );
+  assert.equal(r.verdict, "WARN");
+  assert.ok(r.issues.some((i) => i.code === "NO_TOOLS" && i.severity === "warning"));
+});
+
+test("P-004: default timeout is 60s and timeout verdicts carry the launcher hint", () => {
+  assert.equal(DEFAULT_TIMEOUT_MS, 60000);
+  const r = analyzeProbe("slow-launcher", {
+    connected: false,
+    connectError: "initialize handshake timed out after 60000ms",
+    toolsListed: false,
+    tools: [],
+    badCallOutcome: "skipped",
+  });
+  assert.match(r.issues[0].detail, /--timeout/);
+});
+
+test("P-006: formatReports emits one parseable JSON document for multi-server runs", () => {
+  const r1 = analyzeProbe("a", baseProbe());
+  const r2 = analyzeProbe("b", baseProbe());
+  const multi = formatReports([r1, r2], true);
+  const parsed = JSON.parse(multi);
+  assert.ok(Array.isArray(parsed));
+  assert.equal(parsed.length, 2);
+  const single = formatReports([r1], true);
+  assert.equal(JSON.parse(single).target, "a");
+  const text = formatReports([r1, r2], false);
+  assert.ok(text.includes("mcpaudit a:") && text.includes("mcpaudit b:"));
+});
+
+test("probe: zero-tools fixture passes as a prompt/resource server", async () => {
+  const probe = await probeServer(
+    { label: "zero-tools", command: process.execPath, args: [fixture("zero-tools-server.mjs")] },
+    { timeoutMs: 10000 },
+  );
+  assert.equal(probe.connected, true, probe.connectError);
+  assert.equal(probe.tools.length, 0);
+  assert.equal(probe.promptsCount, 1);
+  assert.equal(probe.resourcesCount, 1);
+  const report = analyzeProbe("zero-tools", probe);
+  assert.equal(report.verdict, "PASS", JSON.stringify(report.issues));
+  assert.equal(report.score, 100);
+});
+
+test("probe: huge fixture server (600 tools) audits completely", async () => {
+  const probe = await probeServer(
+    { label: "huge", command: process.execPath, args: [fixture("huge-server.mjs")] },
+    { timeoutMs: 15000 },
+  );
+  assert.equal(probe.connected, true, probe.connectError);
+  assert.equal(probe.tools.length, 600);
+  const report = analyzeProbe("huge", probe);
+  assert.equal(report.summary.toolCount, 600);
+  assert.equal(report.verdict, "PASS", JSON.stringify(report.issues.slice(0, 3)));
 });

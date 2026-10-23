@@ -19,7 +19,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 /** Protocol versions this build knows about (warn, never fail, on newer ones). */
 export const KNOWN_PROTOCOL_VERSIONS = [
@@ -193,6 +193,17 @@ export function validateTools(tools: RawTool[]): AuditIssue[] {
             detail: `None of this tool's ${undescribed.length} parameter(s) carry a description. Models guess argument semantics from descriptions.`,
             evidence: undescribed.slice(0, 8).join(", "),
           });
+        } else if (undescribed.length > 0) {
+          // Partial gaps are real (production validation found them on
+          // filesystem/everything tools) but weaker evidence than a fully
+          // undocumented tool — info level, naming the parameters.
+          issues.push({
+            code: "PARAMS_PARTIALLY_UNDESCRIBED",
+            severity: "info",
+            tool: name,
+            detail: `${undescribed.length} of this tool's ${Object.keys(props).length} parameter(s) carry no description: ${undescribed.slice(0, 8).join(", ")}. Models guess those arguments' semantics.`,
+            evidence: undescribed.slice(0, 8).join(", "),
+          });
         }
       }
     }
@@ -218,10 +229,15 @@ export function analyzeProbe(target: string, probe: ProbeResult): AuditReport {
   const checkedAt = new Date().toISOString();
 
   if (!probe.connected) {
+    let detail = `Server did not complete the MCP initialize handshake. ${probe.connectError ?? ""}`.trim();
+    if (/timed out/i.test(probe.connectError ?? "")) {
+      detail +=
+        " Hint: the timeout covers the whole launch path — a server started through npx/uvx can spend longer than this on first-run package downloads alone. Re-run with a larger --timeout (for example --timeout 90000) before concluding the server is dead.";
+    }
     issues.push({
       code: "UNREACHABLE",
       severity: "error",
-      detail: `Server did not complete the MCP initialize handshake. ${probe.connectError ?? ""}`.trim(),
+      detail,
       evidence: probe.connectError,
     });
     return {
@@ -270,18 +286,33 @@ export function analyzeProbe(target: string, probe: ProbeResult): AuditReport {
     });
   }
   if (probe.initializeMs !== undefined && probe.initializeMs > 3000) {
+    // Initialize time is measured from spawn, so it includes launcher
+    // (npx/uvx) startup and first-run downloads — production validation
+    // measured healthy servers at 3-26s through their documented launch
+    // commands, and the old warning-at-3s rule scored the audit machine,
+    // not the server (no healthy server could PASS). The measurement is
+    // reported as evidence at info level; only an extreme handshake
+    // (>30s, where real clients genuinely start timing out even after
+    // warm starts) is scored as a warning.
+    const extreme = probe.initializeMs > 30000;
     issues.push({
       code: "HANDSHAKE_SLOW",
-      severity: "warning",
-      detail: `Initialize took ${Math.round(probe.initializeMs)}ms. Slow handshakes make clients time out and make the server feel broken.`,
+      severity: extreme ? "warning" : "info",
+      detail: extreme
+        ? `Initialize took ${Math.round(probe.initializeMs)}ms. Even accounting for launcher (npx/uvx) startup included in this measurement, a handshake this slow makes real clients time out.`
+        : `Initialize took ${Math.round(probe.initializeMs)}ms measured from spawn, including launcher (npx/uvx) startup and any first-run downloads — reported as evidence, not scored, because that latency belongs mostly to the launch path rather than the server.`,
       evidence: `${Math.round(probe.initializeMs)}ms`,
     });
   }
-  if (probe.toolsCapability === false) {
+  // Only a contradiction is a finding: tools were listed successfully even
+  // though no tools capability was advertised. A server that honestly
+  // declares no tools capability and serves prompts/resources instead is
+  // not "missing" anything.
+  if (probe.toolsCapability === false && probe.toolsListed && probe.tools.length > 0) {
     issues.push({
       code: "TOOLS_CAPABILITY_MISSING",
       severity: "warning",
-      detail: "Initialize result did not advertise a tools capability, yet clients will still try tools/list. Declaring capabilities honestly prevents client confusion.",
+      detail: "Initialize result did not advertise a tools capability, yet tools/list returned tools. Declaring capabilities honestly prevents client confusion.",
     });
   }
 
@@ -301,7 +332,33 @@ export function analyzeProbe(target: string, probe: ProbeResult): AuditReport {
         evidence: probe.strictListError.slice(0, 200),
       });
     }
-    issues.push(...validateTools(probe.tools));
+    if (probe.tools.length === 0) {
+      // Zero tools is only an error when the server claimed a tools
+      // surface. A prompt/resource server is a legitimate MCP server —
+      // say what it actually serves instead of failing it for a feature
+      // it never advertised.
+      const prompts = probe.promptsCount ?? 0;
+      const resources = probe.resourcesCount ?? 0;
+      if (prompts > 0 || resources > 0) {
+        issues.push({
+          code: "PROMPTS_RESOURCES_ONLY",
+          severity: "info",
+          detail: `Server exposes no tools; it serves ${prompts} prompt(s) and ${resources} resource(s) instead. Tool checks do not apply to this server.`,
+          evidence: `prompts=${prompts}, resources=${resources}`,
+        });
+      } else if (probe.toolsCapability === false) {
+        issues.push({
+          code: "NO_TOOLS",
+          severity: "warning",
+          detail:
+            "Server reported zero tools, did not advertise a tools capability, and no prompts or resources were listed either. Clients get no callable surface from this server.",
+        });
+      } else {
+        issues.push(...validateTools(probe.tools));
+      }
+    } else {
+      issues.push(...validateTools(probe.tools));
+    }
   }
 
   switch (probe.badCallOutcome) {
@@ -356,6 +413,8 @@ export function analyzeProbe(target: string, probe: ProbeResult): AuditReport {
       serverName: probe.serverName,
       serverVersion: probe.serverVersion,
       toolCount: probe.tools.length,
+      promptsCount: probe.promptsCount,
+      resourcesCount: probe.resourcesCount,
       initializeMs: probe.initializeMs,
       toolsListMs: probe.toolsListMs,
       badCallOutcome: probe.badCallOutcome,
@@ -392,10 +451,12 @@ export function renderReport(r: AuditReport): string {
   const lines: string[] = [];
   lines.push(`mcpaudit ${r.target}: ${r.verdict} (score ${r.score}/100, grade ${r.grade})`);
   if (!s.connected) {
-    lines.push(`  [ERROR] UNREACHABLE: server did not complete the initialize handshake`);
+    // The UNREACHABLE issue below carries the full detail; no summary line here.
   } else {
     lines.push(
       `  server: ${s.serverName ?? "(unnamed)"} ${s.serverVersion ?? ""} · protocol ${s.protocolVersion ?? "(none)"} · ${s.toolCount} tool(s)` +
+        (s.promptsCount !== undefined ? ` · ${s.promptsCount} prompt(s)` : "") +
+        (s.resourcesCount !== undefined ? ` · ${s.resourcesCount} resource(s)` : "") +
         (s.initializeMs !== undefined ? ` · initialize ${Math.round(s.initializeMs)}ms` : "") +
         (s.toolsListMs !== undefined ? ` · tools/list ${Math.round(s.toolsListMs)}ms` : ""),
     );
@@ -457,7 +518,56 @@ export function parseCommandLine(line: string): string[] {
 
 export function targetFromCommand(argv: string[], label?: string): ServerTarget {
   if (argv.length === 0) throw new Error("Empty server command.");
+  if (/^https?:\/\//i.test(argv[0])) {
+    return { label: label ?? argv[0], command: "", args: [], remoteUrl: argv[0] };
+  }
   return { label: label ?? argv.join(" "), command: argv[0], args: argv.slice(1) };
+}
+
+/** mcpaudit's own value-taking CLI flags for `audit` (everything else is the server's). */
+export const AUDIT_VALUE_FLAGS = ["--config", "--server", "--timeout", "--cmdline"];
+
+/**
+ * Extract the server command from `audit` arguments.
+ *
+ * Only mcpaudit's own flags are removed (`--json`, and the value flags in
+ * AUDIT_VALUE_FLAGS), wherever they appear before a `--` separator. Every
+ * other token — crucially including server arguments that start with
+ * `--`, such as `--repository <path>` — passes through verbatim, in
+ * order. After a literal `--`, ALL tokens are the server command.
+ * (Production validation P-001: the previous collector dropped every
+ * `--*` token and stranded their values as stray positional arguments,
+ * corrupting launches for a large share of real servers.)
+ */
+export function extractServerCommand(rest: string[]): string[] {
+  const sep = rest.indexOf("--");
+  const ownPart = sep >= 0 ? rest.slice(0, sep) : rest;
+  const serverPart = sep >= 0 ? rest.slice(sep + 1) : [];
+  const out: string[] = [];
+  for (let i = 0; i < ownPart.length; i++) {
+    const a = ownPart[i];
+    if (AUDIT_VALUE_FLAGS.includes(a)) {
+      i++;
+      continue;
+    }
+    if (a === "--json") continue;
+    out.push(a);
+  }
+  return [...out, ...serverPart];
+}
+
+/**
+ * Render one or more reports as a single output document. JSON mode
+ * always produces exactly one parseable JSON document: the report object
+ * for a single target, an array for several. (Production validation
+ * P-006: multi-server --config --json previously emitted concatenated
+ * objects that no JSON parser could read.)
+ */
+export function formatReports(reports: AuditReport[], asJson: boolean): string {
+  if (asJson) {
+    return JSON.stringify(reports.length === 1 ? reports[0] : reports, null, 2);
+  }
+  return reports.map((r) => renderReport(r)).join("\n");
 }
 
 /**
@@ -481,7 +591,16 @@ export function parseConfig(text: string, only?: string): ServerTarget[] {
   for (const map of maps) {
     for (const [name, entry] of Object.entries(map)) {
       if (only && name !== only) continue;
-      if (!isPlainObject(entry) || typeof entry.command !== "string") continue;
+      if (!isPlainObject(entry)) continue;
+      if (typeof entry.command !== "string") {
+        // Remote (HTTP/SSE) entry: surface it as a remote target so the
+        // audit reports it honestly as unsupported-by-this-build instead
+        // of silently skipping it (production validation P-005).
+        if (typeof entry.url === "string") {
+          targets.push({ label: name, command: "", args: [], remoteUrl: entry.url });
+        }
+        continue;
+      }
       targets.push({
         label: name,
         command: entry.command,
@@ -495,6 +614,9 @@ export function parseConfig(text: string, only?: string): ServerTarget[] {
   }
   if (targets.length > 0) return targets;
 
+  if (typeof data.url === "string" && typeof data.command !== "string") {
+    return [{ label: only ?? "config", command: "", args: [], remoteUrl: data.url }];
+  }
   if (typeof data.command === "string") {
     return [
       {

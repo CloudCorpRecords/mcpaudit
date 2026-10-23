@@ -14,9 +14,10 @@ import { readFile } from "node:fs/promises";
 import {
   analyzeProbe,
   auditToolsDump,
+  extractServerCommand,
+  formatReports,
   parseCommandLine,
   parseConfig,
-  renderReport,
   targetFromCommand,
   VERSION,
 } from "./audit.js";
@@ -30,7 +31,14 @@ function usage(): never {
   mcpaudit audit --cmdline "<command line>" [--json]
   mcpaudit tools <tools.json> [--json]
   mcpaudit mcp
-  mcpaudit --version`);
+  mcpaudit --version
+
+Server arguments pass through verbatim, including arguments that start
+with -- (for example: mcpaudit audit uvx mcp-server-git --repository /path).
+Use a literal -- to force everything after it into the server command:
+  mcpaudit audit node server.js -- --timeout 5000
+mcpaudit audits stdio servers; remote (HTTP) endpoints are reported as
+unsupported rather than launched.`);
   process.exit(2);
 }
 
@@ -43,25 +51,8 @@ function has(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
-/** Everything after `audit` that is not one of our flags is the server command. */
-function commandArgs(args: string[]): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === "--") continue;
-    if (a === "--config" || a === "--server" || a === "--timeout" || a === "--cmdline") {
-      i++;
-      continue;
-    }
-    if (a.startsWith("--")) continue;
-    out.push(a);
-  }
-  return out;
-}
-
 function emit(report: AuditReport, asJson: boolean): void {
-  if (asJson) console.log(JSON.stringify(report, null, 2));
-  else console.log(renderReport(report));
+  console.log(formatReports([report], asJson));
 }
 
 async function auditTarget(target: ServerTarget, timeoutMs?: number): Promise<AuditReport> {
@@ -82,32 +73,41 @@ async function main(): Promise<void> {
   if (!cmd) usage();
   try {
     if (cmd === "audit") {
-      const timeoutRaw = flag(rest, "--timeout");
+      // mcpaudit's own flags live before a literal `--`; everything after
+      // `--` belongs to the server command.
+      const sep = rest.indexOf("--");
+      const ownPart = sep >= 0 ? rest.slice(0, sep) : rest;
+      const timeoutRaw = flag(ownPart, "--timeout");
       const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
       if (timeoutRaw && (!Number.isFinite(timeoutMs) || (timeoutMs as number) <= 0)) {
         console.error(`error: --timeout must be a positive number of milliseconds`);
         process.exit(2);
       }
-      const asJson = has(rest, "--json");
-      const configPath = flag(rest, "--config");
-      const cmdline = flag(rest, "--cmdline");
+      const asJson = has(ownPart, "--json");
+      const configPath = flag(ownPart, "--config");
+      const cmdline = flag(ownPart, "--cmdline");
       let targets: ServerTarget[];
       if (configPath) {
         const text = await readFile(configPath, "utf8");
-        targets = parseConfig(text, flag(rest, "--server"));
+        targets = parseConfig(text, flag(ownPart, "--server"));
       } else if (cmdline) {
         targets = [targetFromCommand(parseCommandLine(cmdline))];
       } else {
-        const argv = commandArgs(rest);
+        const argv = extractServerCommand(rest);
         if (argv.length === 0) usage();
         targets = [targetFromCommand(argv)];
       }
       let worst = 0;
+      const reports: AuditReport[] = [];
       for (const t of targets) {
         const report = await auditTarget(t, timeoutMs);
-        emit(report, asJson);
+        reports.push(report);
+        if (!asJson) console.log(formatReports([report], false));
         if (report.verdict === "FAIL" || report.verdict === "UNREACHABLE") worst = 1;
       }
+      // JSON mode: exactly one parseable document for the whole run
+      // (an array when a config named several servers).
+      if (asJson) console.log(formatReports(reports, true));
       process.exit(worst);
     } else if (cmd === "tools") {
       const file = rest.find((a) => !a.startsWith("--"));

@@ -24,7 +24,7 @@ server.tool(
     command: z.string().describe("Server launch command, e.g. npx or node"),
     args: z.array(z.string()).optional().describe("Command arguments, e.g. [\"-y\", \"@reneturcios/shipcheck\", \"mcp\"]"),
     env: z.record(z.string()).optional().describe("Extra environment variables for the server process"),
-    timeoutMs: z.number().optional().describe("Per-step timeout in milliseconds, default 15000"),
+    timeoutMs: z.number().optional().describe("Per-step timeout in milliseconds, default 60000"),
   },
   async ({ command, args, env, timeoutMs }) => {
     const target = targetFromCommand([command, ...(args ?? [])]);
@@ -41,7 +41,7 @@ server.tool(
   {
     path: z.string().describe("Path to the config JSON file, on the machine running this server"),
     server: z.string().optional().describe("Only audit this named entry"),
-    timeoutMs: z.number().optional().describe("Per-step timeout in milliseconds, default 15000"),
+    timeoutMs: z.number().optional().describe("Per-step timeout in milliseconds, default 60000"),
   },
   async ({ path, server: only, timeoutMs }) => {
     const text = await readFile(path, "utf8");

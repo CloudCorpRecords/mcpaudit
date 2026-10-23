@@ -57,6 +57,10 @@ export interface ProbeResult {
   /** Milliseconds for tools/list. */
   toolsListMs?: number;
   tools: RawTool[];
+  /** prompts/list count, when the server advertised a prompts capability and answered. */
+  promptsCount?: number;
+  /** resources/list count, when the server advertised a resources capability and answered. */
+  resourcesCount?: number;
   /**
    * Result of calling a tool name that does not exist:
    * "error"   = server returned a JSON-RPC error and stayed alive (correct),
@@ -83,6 +87,8 @@ export interface AuditReport {
     serverName?: string;
     serverVersion?: string;
     toolCount: number;
+    promptsCount?: number;
+    resourcesCount?: number;
     initializeMs?: number;
     toolsListMs?: number;
     badCallOutcome: ProbeResult["badCallOutcome"];
@@ -99,9 +105,11 @@ export interface ServerTarget {
   args: string[];
   env?: Record<string, string>;
   cwd?: string;
+  /** Set when the target is a remote (HTTP) MCP endpoint rather than a stdio command. */
+  remoteUrl?: string;
 }
 
 export interface AuditOptions {
-  /** Per-request timeout for initialize / tools/list / bad call. Default 15000. */
+  /** Per-request timeout for initialize / tools/list / bad call. Default 60000. */
   timeoutMs?: number;
 }

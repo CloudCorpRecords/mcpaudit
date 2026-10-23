@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.1.1 (2026-10-22)
+
+Earned fixes from the first real-production validation battery: 25+ external
+MCP servers (official Node and Python servers, third-party servers, remote
+endpoints, and chaos fixtures) audited with the published 0.1.0 binary, three
+runs each, findings hand-checked against raw tools/list ground truth.
+
+- **Server arguments starting with `--` now pass through verbatim.** The CLI
+  previously deleted every `--*` token from the server command and stranded
+  the values, corrupting launches for servers that need `--repository`,
+  `--db-path`, `--headless`, etc. (mcp-server-git was unauditable via the CLI
+  while the same server audited fine via `--config`). Only mcpaudit's own
+  flags are extracted now, and a literal `--` forces everything after it
+  into the server command.
+- **Prompt/resource-only servers are no longer failed for having no tools.**
+  The probe now lists prompts/resources when the server advertises them; a
+  server serving prompts/resources instead of tools gets an informational
+  note and can PASS. Zero tools with no other surface is a warning; zero
+  tools despite advertising a tools capability remains an error.
+- **Default per-step timeout raised from 15s to 60s.** Healthy servers
+  launched through uvx/npx cold starts measured 25-40s to initialize and
+  were reported UNREACHABLE at the old default. Timeout verdicts now carry
+  a hint that the timeout covers launcher startup and how to raise it.
+- **Remote (HTTP) servers are reported, not silently skipped or spawned.**
+  Config entries with a `url` (Claude, Cursor, and VS Code shapes) now
+  produce an UNREACHABLE report explaining mcpaudit audits stdio servers,
+  whether they appear alone or mixed into a config; a URL passed as a CLI
+  command gets the same explanation instead of `spawn … ENOENT`.
+- **`--json` output is always one parseable document.** Multi-server config
+  runs now emit a JSON array instead of concatenated objects.
+- HANDSHAKE_SLOW findings now state that initialize time includes launcher
+  (npx/uvx) startup; the duplicated UNREACHABLE summary line in text reports
+  is removed; the probe's client version tracks the package version.
+- **Initialize time no longer decides verdicts by itself.** The battery
+  proved the old warning-at-3s rule scored the audit machine, not the
+  server: no healthy server scored PASS in any 0.1.0 run (a ground-truth-
+  clean server scored WARN/97 from launcher latency alone). Initialize
+  time is now reported as unscored evidence, and only an extreme handshake
+  (>30s) is scored as a warning.
+- Partial parameter-description gaps are now reported (info level, naming
+  the parameters) instead of only the all-parameters-undescribed case —
+  the battery found the partial shape on real filesystem/everything tools.
+- Regression corpus: the battery fixtures (prompt/resource-only server,
+  stdout-banner server, 600-tool server) joined the test suite; 36 tests.
+
 ## 0.1.0 (2026-10-22)
 
 First release. Wave 1, package 4 of the 100-packages plan.

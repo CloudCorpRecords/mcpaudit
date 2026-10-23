@@ -15,6 +15,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { z } from "zod";
+import { VERSION } from "./audit.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { AuditOptions, ProbeResult, RawTool, ServerTarget } from "./types.js";
@@ -62,6 +63,17 @@ class TapTransport implements Transport {
 
 const BAD_TOOL_NAME = "mcpaudit_nonexistent_tool_zz9";
 
+/**
+ * Default per-step timeout. Production validation (P-004) measured real
+ * launcher startup (npx/uvx cold starts) at 25-40s for healthy servers —
+ * the previous 15s default reported the whole uvx ecosystem UNREACHABLE.
+ */
+export const DEFAULT_TIMEOUT_MS = 60000;
+
+export function remoteUnsupportedError(url: string): string {
+  return `Remote MCP servers are not supported by this mcpaudit build: it audits stdio servers only. "${url}" is an HTTP endpoint, not a launch command — audit the server's stdio launch command (command + args) instead.`;
+}
+
 function errText(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
@@ -80,13 +92,19 @@ async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<
 }
 
 export async function probeServer(target: ServerTarget, opts: AuditOptions = {}): Promise<ProbeResult> {
-  const timeoutMs = opts.timeoutMs ?? 15000;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const result: ProbeResult = {
     connected: false,
     toolsListed: false,
     tools: [],
     badCallOutcome: "skipped",
   };
+
+  const remoteUrl = target.remoteUrl ?? (/^https?:\/\//i.test(target.command) ? target.command : undefined);
+  if (remoteUrl) {
+    result.connectError = remoteUnsupportedError(remoteUrl);
+    return result;
+  }
 
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (typeof v === "string") env[k] = v;
@@ -105,7 +123,7 @@ export async function probeServer(target: ServerTarget, opts: AuditOptions = {})
   });
 
   const tap = new TapTransport(transport);
-  const client = new Client({ name: "mcpaudit", version: "0.1.0" }, { capabilities: {} });
+  const client = new Client({ name: "mcpaudit", version: VERSION }, { capabilities: {} });
   let closed = false;
   const close = async () => {
     if (closed) return;
@@ -170,6 +188,30 @@ export async function probeServer(target: ServerTarget, opts: AuditOptions = {})
       return result;
     }
   }
+
+  // Prompts/resources surface: a server is allowed to be a prompt or
+  // resource server with no tools at all — the analyzer needs the real
+  // counts to tell "no tools, by design" from "no surface at all".
+  // Only ask when the server advertised the capability; count the first
+  // page (enough to establish the surface exists).
+  const listCount = async (method: "prompts/list" | "resources/list", key: "prompts" | "resources"): Promise<number | undefined> => {
+    try {
+      const raw = await withTimeout(
+        client.request(
+          { method, params: {} },
+          z.object({ [key]: z.array(z.unknown()) }).passthrough(),
+        ),
+        Math.min(timeoutMs, 10000),
+        method,
+      );
+      const arr = (raw as Record<string, unknown>)[key];
+      return Array.isArray(arr) ? arr.length : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  if (caps?.prompts !== undefined) result.promptsCount = await listCount("prompts/list", "prompts");
+  if (caps?.resources !== undefined) result.resourcesCount = await listCount("resources/list", "resources");
 
   // Deliberately bad call: a tool name that cannot exist.
   try {

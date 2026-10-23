@@ -18,8 +18,13 @@ mcpaudit launches the server the way a real client does, runs the full handshake
 | input schemas | Present, an object schema, valid `properties`, `required` fields that actually exist |
 | parameter docs | Tools whose parameters are *all* undescribed get flagged — models guess semantics from descriptions |
 | error handling | A call to a nonexistent tool returns a proper error, fast, without killing the server |
+| prompts / resources | A server with no tools is not failed for it: when it advertises prompts/resources, mcpaudit lists them and audits it as what it is |
 
 Scoring: start at 100, each error costs 8, each warning costs 3. Verdicts: **PASS** (clean), **WARN** (works, but the issues will cost it users or correctness), **FAIL** (error-severity issues), **UNREACHABLE** (the handshake never completed — reported with the launch error, never a guessed score).
+
+mcpaudit audits **stdio** servers. Remote (HTTP) servers — config entries with a `url`, or a URL passed as the command — are reported as UNREACHABLE with that explanation, never silently skipped and never spawned.
+
+New in 0.1.1, from the first real-production validation battery (25+ external servers, three runs each, findings hand-checked against raw ground truth): server arguments starting with `--` pass through verbatim (see Usage), prompt/resource-only servers pass, the default per-step timeout is 60s so npx/uvx cold starts are not mistaken for dead servers, and `--json` always emits one parseable document.
 
 ## Usage
 
@@ -33,6 +38,13 @@ npx @reneturcios/mcpaudit audit node dist/cli.js mcp
 # Audit every server in an MCP client config (or one named entry)
 npx @reneturcios/mcpaudit audit --config ~/.claude/claude_desktop_config.json
 npx @reneturcios/mcpaudit audit --config ./mcp.json --server greenlight
+
+# Server arguments that start with -- pass through untouched
+npx @reneturcios/mcpaudit audit uvx mcp-server-git --repository /path/to/repo
+
+# Use a literal -- to force everything after it into the server command
+# (even flags that share a name with mcpaudit's own, like --timeout)
+npx @reneturcios/mcpaudit audit node server.js -- --timeout 5000
 
 # Quoted command line, machine-readable output, custom timeout
 npx @reneturcios/mcpaudit audit --cmdline "npx -y @scope/pkg mcp" --json --timeout 30000
