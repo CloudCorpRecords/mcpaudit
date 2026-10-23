@@ -1,0 +1,1 @@
+{"mcpServers":{"broken":{"args":["test/fixtures/broken-server.mjs"],"command":"node","env":{"FIXTURE":"1"}},"disabled-no-command":{"url":"https://example.invalid/mcp"},"good":{"args":["test/fixtures/good-server.mjs"],"command":"node"}}}
