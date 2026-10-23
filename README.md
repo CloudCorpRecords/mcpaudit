@@ -45,11 +45,16 @@ Example output:
 
 ```
 mcpaudit npx -y @reneturcios/shipcheck mcp: PASS (score 100/100, grade A)
-  server: shipcheck 0.1.0 · protocol 2025-03-26 · 3 tool(s) · initialize 812ms · tools/list 4ms
+  server: shipcheck 0.1.0 · protocol 2025-11-25 · 3 tool(s) · initialize 1813ms · tools/list 16ms
   error handling: bad tool call returned a proper error
   No issues found.
 PASS: handshake, schemas, and error handling all check out.
 ```
+
+(That is a real run, from the first MCP Server Index seed, 2026-10-22.
+Initialize time is measured from spawn and includes npx cold-start
+overhead — the report measures the launch path a user's client actually
+experiences, and says so.)
 
 Exit codes: 0 for PASS/WARN, 1 for FAIL/UNREACHABLE, 2 for usage errors — CI-ready.
 
