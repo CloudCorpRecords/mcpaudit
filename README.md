@@ -65,8 +65,10 @@ PASS: handshake, schemas, and error handling all check out.
 
 (That is a real run, from the first MCP Server Index seed, 2026-10-22.
 Initialize time is measured from spawn and includes npx cold-start
-overhead — the report measures the launch path a user's client actually
-experiences, and says so.)
+overhead, and the report says so. A slow initialize is only scored when
+the server itself is slow once running: if tools/list answers within
+5s, a 30s+ initialize is reported as unscored launch path evidence,
+because that time went to the launcher or to first-run downloads.)
 
 Exit codes: 0 for PASS/WARN, 1 for FAIL/UNREACHABLE, 2 for usage errors — CI-ready.
 

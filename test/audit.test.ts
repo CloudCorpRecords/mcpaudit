@@ -188,16 +188,47 @@ test("tools/list failure is a FAIL with TOOLS_LIST_FAILED", () => {
   assert.ok(r.issues.some((i) => i.code === "TOOLS_LIST_FAILED"));
 });
 
-test("slow handshake: info under 30s (launcher-dominated), warning above 30s", () => {
+test("slow handshake: info under 30s (launcher-dominated), warning above 30s when the server itself is slow", () => {
   const info = analyzeProbe("x", baseProbe({ initializeMs: 9000 }));
   const infoIssue = info.issues.find((i) => i.code === "HANDSHAKE_SLOW");
   assert.ok(infoIssue, "expected a HANDSHAKE_SLOW note at 9000ms");
   assert.equal(infoIssue.severity, "info");
   assert.equal(info.verdict, "PASS", "launcher latency alone must not cost the verdict");
-  const warn = analyzeProbe("x", baseProbe({ initializeMs: 45000 }));
+  // Above 30s with a tools/list that is also slow: the server, not just
+  // its launcher, is slow, so the warning is scored.
+  const warn = analyzeProbe("x", baseProbe({ initializeMs: 45000, toolsListMs: 12000 }));
   const warnIssue = warn.issues.find((i) => i.code === "HANDSHAKE_SLOW");
   assert.equal(warnIssue?.severity, "warning");
   assert.equal(warn.verdict, "WARN");
+  assert.equal(warn.score, 97);
+});
+
+test("cold start: a >30s initialize with a fast tools/list is launcher latency, not a scored warning", () => {
+  // The fleet audit shape: healthy servers launched through npx/uvx cold
+  // starts scored WARN/97 on initialize time alone while answering
+  // tools/list in milliseconds once up.
+  const r = analyzeProbe("x", baseProbe({ initializeMs: 45000, toolsListMs: 5 }));
+  const issue = r.issues.find((i) => i.code === "HANDSHAKE_SLOW");
+  assert.ok(issue, "the measurement is still reported as evidence");
+  assert.equal(issue.severity, "info");
+  assert.match(issue.detail, /tools\/list answered in 5ms/);
+  assert.match(issue.detail, /launch path/);
+  assert.equal(r.verdict, "PASS");
+  assert.equal(r.score, 100);
+});
+
+test("cold start: a >30s initialize with no tools/list timing cannot be excused and still warns", () => {
+  const r = analyzeProbe("x", baseProbe({ initializeMs: 45000, toolsListMs: undefined }));
+  const issue = r.issues.find((i) => i.code === "HANDSHAKE_SLOW");
+  assert.equal(issue?.severity, "warning");
+  assert.equal(r.verdict, "WARN");
+});
+
+test("cold start boundary: tools/list at exactly 5s still corroborates a fast server, 5001ms does not", () => {
+  const at = analyzeProbe("x", baseProbe({ initializeMs: 31000, toolsListMs: 5000 }));
+  assert.equal(at.issues.find((i) => i.code === "HANDSHAKE_SLOW")?.severity, "info");
+  const over = analyzeProbe("x", baseProbe({ initializeMs: 31000, toolsListMs: 5001 }));
+  assert.equal(over.issues.find((i) => i.code === "HANDSHAKE_SLOW")?.severity, "warning");
 });
 
 test("partially undescribed parameters are an info finding naming them", () => {

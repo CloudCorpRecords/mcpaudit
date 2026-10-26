@@ -19,7 +19,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 
 /** Protocol versions this build knows about (warn, never fail, on newer ones). */
 export const KNOWN_PROTOCOL_VERSIONS = [
@@ -287,20 +287,36 @@ export function analyzeProbe(target: string, probe: ProbeResult): AuditReport {
   }
   if (probe.initializeMs !== undefined && probe.initializeMs > 3000) {
     // Initialize time is measured from spawn, so it includes launcher
-    // (npx/uvx) startup and first-run downloads — production validation
+    // (npx/uvx) startup and first-run downloads: production validation
     // measured healthy servers at 3-26s through their documented launch
     // commands, and the old warning-at-3s rule scored the audit machine,
     // not the server (no healthy server could PASS). The measurement is
     // reported as evidence at info level; only an extreme handshake
     // (>30s, where real clients genuinely start timing out even after
     // warm starts) is scored as a warning.
+    //
+    // Cold-start corroboration: initialize alone cannot tell a slow
+    // server from a slow launch path, but tools/list can. It is measured
+    // after the handshake, against the already running server, so a fast
+    // tools/list (<=5s) under a >30s initialize proves the server itself
+    // answers promptly once it is up: the 30s+ went to the launcher or to
+    // first-run downloads, and scoring it would repeat the WARN/97
+    // cold-start false positives the fleet audit found (every one of
+    // those servers was otherwise clean). The warning now requires the
+    // server to be slow in its own right: tools/list also slow (>5s),
+    // or no tools/list timing to corroborate with.
     const extreme = probe.initializeMs > 30000;
+    const listMs = probe.toolsListMs;
+    const serverResponsive = listMs !== undefined && listMs <= 5000;
+    const scored = extreme && !serverResponsive;
     issues.push({
       code: "HANDSHAKE_SLOW",
-      severity: extreme ? "warning" : "info",
-      detail: extreme
-        ? `Initialize took ${Math.round(probe.initializeMs)}ms. Even accounting for launcher (npx/uvx) startup included in this measurement, a handshake this slow makes real clients time out.`
-        : `Initialize took ${Math.round(probe.initializeMs)}ms measured from spawn, including launcher (npx/uvx) startup and any first-run downloads — reported as evidence, not scored, because that latency belongs mostly to the launch path rather than the server.`,
+      severity: scored ? "warning" : "info",
+      detail: scored
+        ? `Initialize took ${Math.round(probe.initializeMs)}ms and tools/list took ${listMs !== undefined ? `${Math.round(listMs)}ms` : "an unmeasured amount of time"} after that. The server itself is slow once running, not just its launch path, and a handshake this slow makes real clients time out.`
+        : extreme
+          ? `Initialize took ${Math.round(probe.initializeMs)}ms measured from spawn, but tools/list answered in ${Math.round(listMs as number)}ms once the server was up. The slow part was the launch path (launcher startup or first-run downloads), not the server, so this is reported as evidence, not scored. A warm start or a pre-installed server removes most of it.`
+          : `Initialize took ${Math.round(probe.initializeMs)}ms measured from spawn, including launcher (npx/uvx) startup and any first-run downloads. Reported as evidence, not scored, because that latency belongs mostly to the launch path rather than the server.`,
       evidence: `${Math.round(probe.initializeMs)}ms`,
     });
   }

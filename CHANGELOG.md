@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-10-25)
+
+Cold-start handshake tuning, from the fleet audit finding that the scored HANDSHAKE_SLOW warnings in the external index runs were all cold-start artifacts (WARN/97 on otherwise clean servers). Initialize time is measured from spawn, so it cannot by itself tell a slow server from a slow launch path; tools/list can, because it is measured against the already running server. A >30s initialize is now scored as a warning only when tools/list is also slow (>5s) or no tools/list timing exists to corroborate with. When tools/list answered within 5s, the slow initialize is reported as unscored info evidence that names both measurements and attributes the time to the launch path (launcher startup or first-run downloads). 40 tests passing.
+
+Note on the other audit lead: this repo contains no external server index artifact to refresh (the index seed referenced in the README was an external run record, not a file in this repo), so no index results were regenerated or changed here.
+
 ## 0.1.1 (2026-10-22)
 
 Earned fixes from the first real-production validation battery: 25+ external
